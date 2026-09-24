@@ -1,275 +1,49 @@
 #!/usr/bin/env python3
 """
-FileCleaner - Step 1: scan and visualize what is taking up space on your Mac.
+FileCleaner - understand and tidy up the files on your Mac.
 
-This version is strictly READ-ONLY. It never deletes, moves, renames, or
-modifies anything. The only actions it can take are "Reveal in Finder" and
-"Copy path".
+Features:
+  Screener       Sorts everything in Downloads and Desktop into groups
+                 (installers, duplicates, screenshots, school work, ...) and
+                 suggests what to do with each file. Nothing changes until you
+                 press "Apply suggestions...", and "Undo last apply" puts a
+                 whole batch back. Trashed files go to the macOS Trash.
+  Disk Explorer  Shows what is taking up space anywhere on your Mac, as a
+                 folder tree and a treemap. Read-only.
 
-Every file and folder is also classified by how safe it would be to touch:
+Every path is also classified by how safe it would be to touch:
   PROTECTED - part of macOS itself; never delete or move.
-  CAUTION   - app data, settings, installed apps, or developer tools;
-              removing these can break apps or lose settings.
+  CAUTION   - app data, settings, installed apps, or developer tools.
   (blank)   - ordinary user files.
 
 Usage:
-  python3 FileCleaner.py                 # open the GUI, scanning your home folder
-  python3 FileCleaner.py ~/Downloads     # open the GUI on a specific folder
-  python3 FileCleaner.py ~/Downloads --report   # print a text summary instead
+  python3 FileCleaner.py                    # open the app
+  python3 FileCleaner.py --screen           # print the screener's suggestions
+  python3 FileCleaner.py --screen --json suggestions.json
+  python3 FileCleaner.py ~/Downloads --report   # print a disk-usage summary
 
-Tip: macOS hides some folders (Mail, Messages, Safari, etc.) from apps that
-don't have "Full Disk Access". To see them, grant it to the app you run this
-from (Terminal / VS Code) in System Settings > Privacy & Security.
+Tip: macOS asks before letting apps read Desktop, Documents and Downloads.
+Click Allow. If you clicked "Don't Allow" earlier, turn access back on in
+System Settings > Privacy & Security > Files and Folders for the app you run
+this from (Terminal / VS Code).
 """
 
 import argparse
-import heapq
-import itertools
+import hashlib
+import json
 import os
-import stat
+import queue
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-from pathlib import Path
 
-HOME = str(Path.home())
-
-# --------------------------------------------------------------------------
-# Safety classification
-# --------------------------------------------------------------------------
-
-PROTECTED = "protected"
-CAUTION = "caution"
-
-# Checked in order; the first matching prefix wins, so list specific paths
-# before the broader paths that contain them.
-SAFETY_RULES = [
-    ("/usr/local", CAUTION, "Installed tools (e.g. Homebrew)"),
-    ("/opt", CAUTION, "Installed tools (e.g. Homebrew)"),
-    ("/System", PROTECTED, "macOS system"),
-    ("/usr", PROTECTED, "macOS system"),
-    ("/bin", PROTECTED, "macOS system"),
-    ("/sbin", PROTECTED, "macOS system"),
-    ("/private", PROTECTED, "macOS system (etc/var/tmp)"),
-    ("/etc", PROTECTED, "macOS system"),
-    ("/var", PROTECTED, "macOS system"),
-    ("/tmp", PROTECTED, "macOS system"),
-    ("/dev", PROTECTED, "macOS system"),
-    ("/cores", PROTECTED, "macOS system"),
-    ("/Library", PROTECTED, "System-wide app support"),
-    ("/Applications", CAUTION, "Installed app - uninstall properly"),
-    (os.path.join(HOME, "Library"), CAUTION, "App data & settings"),
-    (os.path.join(HOME, "Applications"), CAUTION, "Installed app - uninstall properly"),
-]
-
-
-def classify(path):
-    """Return (level, reason) describing how safe a path is to touch."""
-    if path == "/":
-        return PROTECTED, "Startup disk root"
-    for prefix, level, reason in SAFETY_RULES:
-        if path == prefix or path.startswith(prefix + "/"):
-            return level, reason
-    if ".app/" in path or path.endswith(".app"):
-        return CAUTION, "Application bundle"
-    if path.startswith(HOME + "/"):
-        rel = path[len(HOME) + 1:]
-        if any(part.startswith(".") for part in rel.split("/")):
-            return CAUTION, "Hidden config/data"
-    return "", ""
-
-
-# --------------------------------------------------------------------------
-# File categories (for the "File types" view and treemap colors)
-# --------------------------------------------------------------------------
-
-CATEGORIES = {
-    "Images": "jpg jpeg png gif heic heif tif tiff bmp webp raw cr2 nef arw dng svg psd ai",
-    "Video": "mov mp4 m4v avi mkv wmv flv webm mpg mpeg 3gp",
-    "Audio": "mp3 m4a aac wav aiff aif flac ogg wma alac mid midi",
-    "Documents": "pdf doc docx xls xlsx ppt pptx pages numbers key txt rtf md csv odt epub",
-    "Archives & Installers": "zip dmg pkg tar gz tgz bz2 xz rar 7z iso xip",
-    "Code & Data": "py js ts java c cpp h swift go rs rb php html css json xml yml yaml sql db sqlite ipynb",
-}
-EXT_TO_CATEGORY = {ext: cat for cat, exts in CATEGORIES.items() for ext in exts.split()}
-
-CATEGORY_COLORS = {
-    "Folder": "#5b8def",
-    "Images": "#2bb673",
-    "Video": "#9b59b6",
-    "Audio": "#e67e9f",
-    "Documents": "#3fb8c9",
-    "Archives & Installers": "#f39c4a",
-    "Code & Data": "#8a9a5b",
-    "Other": "#9aa5b1",
-}
-SAFETY_COLORS = {PROTECTED: "#d9534f", CAUTION: "#e8b33a"}
-
-
-def extension_of(name):
-    ext = os.path.splitext(name)[1].lower().lstrip(".")
-    return ext or "(none)"
-
-
-def category_of(name):
-    return EXT_TO_CATEGORY.get(extension_of(name), "Other")
-
-
-def human(n):
-    """Format a byte count the way Finder does (base 1000)."""
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1000 or unit == "TB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1000
-
-
-def fmt_date(ts):
-    return time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else ""
-
-
-# --------------------------------------------------------------------------
-# Scanner
-# --------------------------------------------------------------------------
-
-# Never descend into these (unless the user scans them directly): they are
-# other drives, network mounts, or duplicate views of the same disk.
-SKIP_DIRS = {"/System/Volumes", "/Volumes", "/dev", "/net", "/home"}
-
-
-class Node:
-    __slots__ = ("name", "parent", "is_dir", "size", "count", "mtime", "children", "note")
-
-    def __init__(self, name, parent, is_dir, mtime=0.0, size=0):
-        self.name = name
-        self.parent = parent
-        self.is_dir = is_dir
-        self.size = size  # bytes actually used on disk
-        self.count = 0 if is_dir else 1  # number of files inside
-        self.mtime = mtime
-        self.children = [] if is_dir else None
-        self.note = ""  # e.g. "Permission denied"
-
-    def path(self):
-        parts = []
-        node = self
-        while node is not None:
-            parts.append(node.name)
-            node = node.parent
-        return os.path.join(*reversed(parts))
-
-
-class Scanner:
-    """Walks a folder tree and builds a Node tree with sizes. Read-only."""
-
-    LARGEST_KEEP = 1000
-
-    def __init__(self, root_path):
-        self.root_path = os.path.abspath(os.path.expanduser(root_path))
-        self.cancel_event = threading.Event()
-        self.files_seen = 0
-        self.bytes_seen = 0
-        self.current = ""
-        self.unreadable = []  # folders we were not allowed to read
-        self.ext_stats = {}  # ext -> [bytes, count]
-        self.largest = []  # min-heap of (size, tiebreak, node)
-        self.root = None
-        self.error = None
-        self.done = False
-        self.cancelled = False
-
-    def cancel(self):
-        self.cancel_event.set()
-
-    def run(self):
-        try:
-            self.root = self._scan()
-        except Exception as e:  # report instead of crashing the thread
-            self.error = e
-        finally:
-            self.done = True
-
-    def _scan(self):
-        st = os.stat(self.root_path)
-        if not stat.S_ISDIR(st.st_mode):
-            raise NotADirectoryError(f"Not a folder: {self.root_path}")
-
-        root = Node(self.root_path, None, True, st.st_mtime)
-        seen_dirs = {(st.st_dev, st.st_ino)}
-        seen_hardlinks = set()
-        tiebreak = itertools.count()
-        dirs_in_order = []
-        stack = [root]
-
-        while stack:
-            if self.cancel_event.is_set():
-                self.cancelled = True
-                break
-            node = stack.pop()
-            dirs_in_order.append(node)
-            path = node.path()
-            self.current = path
-            try:
-                with os.scandir(path) as entries:
-                    for entry in entries:
-                        try:
-                            est = entry.stat(follow_symlinks=False)
-                        except OSError:
-                            continue
-                        if stat.S_ISDIR(est.st_mode):
-                            child = Node(entry.name, node, True, est.st_mtime)
-                            node.children.append(child)
-                            key = (est.st_dev, est.st_ino)
-                            child_path = os.path.join(path, entry.name)
-                            if child_path in SKIP_DIRS:
-                                child.note = "Skipped (other volume)"
-                            elif key in seen_dirs:
-                                child.note = "Skipped (already counted)"
-                            else:
-                                seen_dirs.add(key)
-                                stack.append(child)
-                            continue
-
-                        # Files and symlinks. st_blocks is real disk usage, so
-                        # iCloud files that aren't downloaded count as ~0.
-                        size = est.st_blocks * 512
-                        if est.st_nlink > 1 and not stat.S_ISLNK(est.st_mode):
-                            key = (est.st_dev, est.st_ino)
-                            if key in seen_hardlinks:
-                                size = 0
-                            else:
-                                seen_hardlinks.add(key)
-                        child = Node(entry.name, node, False, est.st_mtime, size)
-                        node.children.append(child)
-
-                        self.files_seen += 1
-                        self.bytes_seen += size
-                        ext = extension_of(entry.name)
-                        stats = self.ext_stats.setdefault(ext, [0, 0])
-                        stats[0] += size
-                        stats[1] += 1
-                        item = (size, next(tiebreak), child)
-                        if len(self.largest) < self.LARGEST_KEEP:
-                            heapq.heappush(self.largest, item)
-                        elif size > self.largest[0][0]:
-                            heapq.heapreplace(self.largest, item)
-            except PermissionError:
-                node.note = "Permission denied"
-                self.unreadable.append(path)
-            except OSError as e:
-                node.note = e.strerror or "Unreadable"
-                self.unreadable.append(path)
-
-        # Children always come after their parent in dirs_in_order, so walking
-        # it backwards totals up every folder before its parent needs it.
-        for d in reversed(dirs_in_order):
-            d.size = sum(c.size for c in d.children)
-            d.count = sum(c.count for c in d.children)
-            d.children.sort(key=lambda c: c.size, reverse=True)
-        return root
-
-    def largest_files(self):
-        return [node for _, _, node in sorted(self.largest, reverse=True)]
+from core import (CATEGORY_COLORS, CAUTION, HOME, PROTECTED, SAFETY_COLORS, Scanner,
+                  category_of, classify, fmt_date, human, EXT_TO_CATEGORY)
+import actions
+import screener as scr
 
 
 # --------------------------------------------------------------------------
@@ -328,10 +102,12 @@ def run_gui(start_path):
 
     MAX_TREE_CHILDREN = 300
     MAX_MAP_ITEMS = 150
+    PREVIEW_SIZE = 420
 
     class App:
         def __init__(self, win):
             self.win = win
+            # Disk Explorer state
             self.scanner = None
             self.root_node = None
             self.tree_nodes = {}  # tree iid -> Node
@@ -339,44 +115,49 @@ def run_gui(start_path):
             self.map_items = {}  # canvas tag -> Node (or None for "smaller items")
             self.list_nodes = {}  # largest-files iid -> Node
             self.ignore_next_select = False
+            # Screener state
+            self.screener = None
+            self.screen_items = {}  # screener iid -> Item
+            self.thumb_dir = tempfile.mkdtemp(prefix="filecleaner-previews-")
+            self.thumbs = {}  # path -> PNG path ("" if no preview)
+            self.thumb_queue = queue.Queue()
+            self.preview_path = None
+            self.preview_image = None  # keep a reference so Tk doesn't discard it
+            self.original = {}  # path -> (action, destination) the screener suggested
+            self.choices = {}  # path -> "trash" / "leave" / "suggested", kept across rescans
+            self.batch = None
 
-            win.title("FileCleaner - Disk Explorer (read-only)")
-            win.geometry("1300x800")
+            win.title("FileCleaner")
+            win.geometry("1350x850")
             win.protocol("WM_DELETE_WINDOW", self.on_close)
             self._build_ui(start_path)
+            self._poll_thumbs()
 
         # ---------- layout ----------
 
         def _build_ui(self, start_path):
-            top = ttk.Frame(self.win, padding=8)
-            top.pack(fill="x")
-            ttk.Label(top, text="Folder:").pack(side="left")
-            self.path_var = tk.StringVar(value=start_path)
-            entry = ttk.Entry(top, textvariable=self.path_var)
-            entry.pack(side="left", fill="x", expand=True, padx=6)
-            entry.bind("<Return>", lambda e: self.start_scan())
-            ttk.Button(top, text="Choose...", command=self.choose_folder).pack(side="left")
-            self.scan_btn = ttk.Button(top, text="Scan", command=self.start_scan)
-            self.scan_btn.pack(side="left", padx=(6, 0))
-            self.stop_btn = ttk.Button(top, text="Stop", command=self.stop_scan, state="disabled")
-            self.stop_btn.pack(side="left", padx=(6, 0))
-            self.spinner = ttk.Progressbar(top, mode="indeterminate", length=100)
-            self.spinner.pack(side="left", padx=(10, 0))
-
-            self.status_var = tk.StringVar(value="Choose a folder and press Scan. Nothing will be modified.")
+            self.status_var = tk.StringVar(value="Nothing changes until you press Apply.")
             ttk.Label(self.win, textvariable=self.status_var, anchor="w", padding=(8, 4)).pack(side="bottom", fill="x")
 
-            self.notebook = ttk.Notebook(self.win)
-            self.notebook.pack(fill="both", expand=True, padx=8, pady=(0, 4))
-            self._build_explorer_tab()
-            self._build_largest_tab()
-            self._build_types_tab()
+            self.main_tabs = ttk.Notebook(self.win)
+            self.main_tabs.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+            self._build_screener_tab()
+            self._build_disk_tab(start_path)
 
             self.menu = tk.Menu(self.win, tearoff=0)
             self.menu.add_command(label="Reveal in Finder", command=lambda: self._menu_action("reveal"))
             self.menu.add_command(label="Copy path", command=lambda: self._menu_action("copy"))
             self.menu.add_command(label="Show in Explorer", command=lambda: self._menu_action("show"))
             self.menu_node = None
+
+            self.screen_menu = tk.Menu(self.win, tearoff=0)
+            self.screen_menu.add_command(label="Quick Look", command=lambda: self._screen_action("quicklook"))
+            self.screen_menu.add_command(label="Reveal in Finder", command=lambda: self._screen_action("reveal"))
+            self.screen_menu.add_command(label="Copy path", command=lambda: self._screen_action("copy"))
+            self.screen_menu.add_separator()
+            self.screen_menu.add_command(label="Trash this file  (T)", command=lambda: self.set_choice("trash"))
+            self.screen_menu.add_command(label="Don't change this file  (L)", command=lambda: self.set_choice("leave"))
+            self.screen_menu.add_command(label="Back to the suggestion  (S)", command=lambda: self.set_choice("suggested"))
 
         def _scrolled_tree(self, parent, columns, show="tree headings"):
             frame = ttk.Frame(parent)
@@ -390,22 +171,517 @@ def run_gui(start_path):
             tree.tag_configure("muted", foreground="gray")
             return frame, tree
 
+        def _setup_columns(self, tree, specs, stretch):
+            for col, label, width, anchor in specs:
+                tree.heading(col, text=label)
+                tree.column(col, width=width, anchor=anchor, stretch=(col in stretch))
+
+        # ======================================================================
+        # Screener tab
+        # ======================================================================
+
+        def _build_screener_tab(self):
+            tab = ttk.Frame(self.main_tabs, padding=(0, 6, 0, 0))
+            self.main_tabs.add(tab, text="Screener")
+
+            bar = ttk.Frame(tab)
+            bar.pack(fill="x", pady=(0, 6))
+            self.screen_btn = ttk.Button(bar, text="Rescan Downloads & Desktop", command=self.start_screen)
+            self.screen_btn.pack(side="left")
+            self.screen_spinner = ttk.Progressbar(bar, mode="indeterminate", length=100)
+            self.screen_spinner.pack(side="left", padx=(10, 0))
+            self.screen_summary = tk.StringVar()
+            ttk.Label(bar, textvariable=self.screen_summary, font=("Helvetica", 13, "bold")).pack(side="left", padx=12)
+            self.undo_btn = ttk.Button(bar, text="Undo last apply", command=self.undo_last_apply)
+            self.undo_btn.pack(side="right")
+            self.apply_btn = ttk.Button(bar, text="Apply suggestions...", command=self.open_apply_dialog,
+                                        state="disabled")
+            self.apply_btn.pack(side="right", padx=6)
+            self._update_undo_button()
+
+            paned = ttk.PanedWindow(tab, orient="horizontal")
+            paned.pack(fill="both", expand=True)
+
+            frame, tree = self._scrolled_tree(paned, ("size", "added", "action", "why"))
+            self.screen_tree = tree
+            self._setup_columns(tree, (
+                ("#0", "Name", 300, "w"),
+                ("size", "Size", 85, "e"),
+                ("added", "Added", 90, "center"),
+                ("action", "Suggestion", 250, "w"),
+                ("why", "Why", 300, "w"),
+            ), stretch=("#0", "why"))
+            tree.tag_configure("group", font=("Helvetica", 13, "bold"))
+            tree.bind("<<TreeviewSelect>>", self.on_screen_select)
+            tree.bind("<Double-Button-1>", lambda e: self._screen_action("quicklook"))
+            tree.bind("<space>", lambda e: self._screen_action("quicklook"))
+            for key, choice in (("t", "trash"), ("l", "leave"), ("s", "suggested")):
+                tree.bind(f"<KeyPress-{key}>", lambda e, c=choice: self.set_choice(c))
+                tree.bind(f"<KeyPress-{key.upper()}>", lambda e, c=choice: self.set_choice(c))
+            for seq in ("<Button-2>", "<Button-3>", "<Control-Button-1>"):
+                tree.bind(seq, self._screen_popup)
+            paned.add(frame, weight=3)
+
+            detail = ttk.Frame(paned, padding=(12, 0, 0, 0))
+            box = ttk.Frame(detail, width=PREVIEW_SIZE, height=PREVIEW_SIZE)
+            box.pack_propagate(False)
+            box.pack(fill="x")
+            self.preview_label = ttk.Label(box, anchor="center", foreground="gray")
+            self.preview_label.pack(fill="both", expand=True)
+
+            self.detail_title = tk.StringVar()
+            ttk.Label(detail, textvariable=self.detail_title, font=("Helvetica", 15, "bold"),
+                      wraplength=PREVIEW_SIZE).pack(anchor="w", pady=(8, 6))
+            fields = ttk.Frame(detail)
+            fields.pack(fill="x")
+            self.detail_vars = {}
+            for row, key in enumerate(("Suggestion", "Why", "Location", "Size", "Added",
+                                       "Last opened", "Downloaded from")):
+                ttk.Label(fields, text=key + ":", foreground="gray").grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=1)
+                var = tk.StringVar()
+                ttk.Label(fields, textvariable=var, wraplength=PREVIEW_SIZE - 110).grid(row=row, column=1, sticky="w", pady=1)
+                self.detail_vars[key] = var
+
+            buttons = ttk.Frame(detail)
+            buttons.pack(fill="x", pady=(10, 0))
+            self.ql_btn = ttk.Button(buttons, text="Quick Look (space)", command=lambda: self._screen_action("quicklook"))
+            self.ql_btn.pack(side="left")
+            self.reveal_btn = ttk.Button(buttons, text="Reveal in Finder", command=lambda: self._screen_action("reveal"))
+            self.reveal_btn.pack(side="left", padx=6)
+            paned.add(detail, weight=2)
+            self._show_item_details(None)
+
+        # ---------- screening ----------
+
+        def start_screen(self):
+            if self.screener and not self.screener.done:
+                return
+            self.screener = scr.Screener()
+            threading.Thread(target=self.screener.run, daemon=True).start()
+            self.screen_btn.configure(state="disabled")
+            self.apply_btn.configure(state="disabled")
+            self.screen_spinner.start(12)
+            self.screen_summary.set("Screening...")
+            self._poll_screen()
+
+        def _poll_screen(self):
+            s = self.screener
+            if not s.done:
+                current = scr.short_path(s.current)
+                if len(current) > 80:
+                    current = "..." + current[-77:]
+                self.status_var.set(f"Screening: {s.stage}... {len(s.items):,} files found   {current}")
+                self.win.after(150, self._poll_screen)
+                return
+            self.screen_spinner.stop()
+            self.screen_btn.configure(state="normal")
+            if s.error:
+                messagebox.showerror("FileCleaner", f"Screening failed:\n{s.error}")
+                self.status_var.set("Screening failed.")
+                self.screen_summary.set("")
+                return
+            self._fill_screen_tree(s)
+            self.apply_btn.configure(state="normal")
+            if s.blocked:
+                names = " and ".join(os.path.basename(p) for p in s.blocked)
+                self.status_var.set(
+                    f"macOS blocked access to {names}. Allow it in System Settings > Privacy & Security > "
+                    "Files and Folders (for Terminal / VS Code), then press Rescan.")
+            else:
+                self.status_var.set("Screening finished. Select a file to preview it. Keys: T = trash, "
+                                    "L = don't change, S = back to suggestion. Nothing changes until you press Apply.")
+
+        def _fill_screen_tree(self, s):
+            tree = self.screen_tree
+            tree.delete(*tree.get_children())
+            self.screen_items.clear()
+            self.original = {i.path: (i.action, i.destination) for i in s.items}
+            for item in s.items:
+                if item.path in self.choices:
+                    self._apply_choice(item, self.choices[item.path])
+            self._update_summary()
+
+            for key, title, blurb, items in s.grouped():
+                actions = {i.action for i in items}
+                if actions == {scr.TRASH}:
+                    group_action = "Trash"
+                elif key == "screenshot":
+                    group_action = "Trash or archive (you choose)"
+                elif actions == {scr.MOVE}:
+                    group_action = "Move to folders"
+                elif actions == {scr.LEAVE}:
+                    group_action = "Leave"
+                else:
+                    group_action = "Mixed"
+                group_iid = tree.insert("", "end", text=f"{title}  ({len(items):,})", tags=("group",),
+                                        open=key not in ("other", "big_old"),
+                                        values=(human(sum(i.size for i in items)), "", group_action, blurb))
+                self.screen_items[group_iid] = (title, blurb, items)
+                for item in items:
+                    iid = tree.insert(group_iid, "end", text=item.name)
+                    self.screen_items[iid] = item
+                    self._refresh_row(iid)
+            self._show_item_details(None)
+
+        # ---------- details & preview ----------
+
+        def on_screen_select(self, _event):
+            sel = self.screen_tree.selection()
+            self._show_item_details(self.screen_items.get(sel[0]) if sel else None)
+
+        def _selected_screen_item(self):
+            sel = self.screen_tree.selection()
+            item = self.screen_items.get(sel[0]) if sel else None
+            return item if isinstance(item, scr.Item) else None
+
+        def _show_item_details(self, item):
+            for var in self.detail_vars.values():
+                var.set("")
+            self.preview_path = None
+            self.preview_image = None
+            self.preview_label.configure(image="", text="")
+            if isinstance(item, tuple):  # a group row
+                title, blurb, items = item
+                self.detail_title.set(title)
+                self.detail_vars["Why"].set(blurb)
+                self.detail_vars["Size"].set(f"{human(sum(i.size for i in items))} in {len(items):,} file{'s' if len(items) != 1 else ''}")
+                self.preview_label.configure(text="Expand the group and select a file to preview it.")
+                state = "disabled"
+            elif item is None:
+                self.detail_title.set("")
+                self.preview_label.configure(text="Select a file to preview it.")
+                state = "disabled"
+            else:
+                self.detail_title.set(item.name)
+                self.detail_vars["Suggestion"].set(self._action_text(item))
+                self.detail_vars["Why"].set("; ".join(item.reasons))
+                self.detail_vars["Location"].set(scr.short_path(os.path.dirname(item.path)))
+                self.detail_vars["Size"].set(human(item.size))
+                self.detail_vars["Added"].set(fmt_date(item.added))
+                self.detail_vars["Last opened"].set(fmt_date(item.last_used))
+                self.detail_vars["Downloaded from"].set(item.where_from[0] if item.where_from else "(not recorded)")
+                self._request_preview(item.path)
+                state = "normal"
+            self.ql_btn.configure(state=state)
+            self.reveal_btn.configure(state=state)
+
+        def _request_preview(self, path):
+            self.preview_path = path
+            if path in self.thumbs:
+                self._display_thumb(path)
+                return
+            self.preview_label.configure(text="Loading preview...")
+            threading.Thread(target=self._make_thumb, args=(path,), daemon=True).start()
+
+        def _make_thumb(self, path):
+            """Ask macOS Quick Look for a preview image (runs in the background)."""
+            out = os.path.join(self.thumb_dir, hashlib.md5(path.encode()).hexdigest())
+            png = ""
+            try:
+                os.makedirs(out, exist_ok=True)
+                subprocess.run(["qlmanage", "-t", "-s", str(PREVIEW_SIZE), "-o", out, path],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                pngs = [f for f in os.listdir(out) if f.endswith(".png")]
+                png = os.path.join(out, pngs[0]) if pngs else ""
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            self.thumb_queue.put((path, png))
+
+        def _poll_thumbs(self):
+            try:
+                while True:
+                    path, png = self.thumb_queue.get_nowait()
+                    self.thumbs[path] = png
+                    if path == self.preview_path:
+                        self._display_thumb(path)
+            except queue.Empty:
+                pass
+            self.win.after(100, self._poll_thumbs)
+
+        def _display_thumb(self, path):
+            png = self.thumbs.get(path)
+            if not png:
+                self.preview_label.configure(image="", text="No preview available.")
+                return
+            try:
+                image = tk.PhotoImage(file=png)
+            except tk.TclError:
+                self.preview_label.configure(image="", text="No preview available.")
+                return
+            factor = max(1, -(-max(image.width(), image.height()) // PREVIEW_SIZE))
+            if factor > 1:
+                image = image.subsample(factor)
+            self.preview_image = image
+            self.preview_label.configure(image=image, text="")
+
+        # ---------- your choices ----------
+
+        def _apply_choice(self, item, choice):
+            action, destination = self.original.get(item.path, (item.action, item.destination))
+            item.excluded = choice == "leave"
+            if choice == "trash":
+                item.action, item.destination = scr.TRASH, ""
+            else:
+                item.action, item.destination = action, destination
+
+        def _action_text(self, item):
+            if item.excluded:
+                return "Leave (your choice)"
+            text = scr.describe_action(item)
+            if (item.action, item.destination) != self.original.get(item.path, (item.action, item.destination)):
+                text += " (your choice)"
+            return text
+
+        def _refresh_row(self, iid):
+            item = self.screen_items[iid]
+            leave = item.excluded or item.action == scr.LEAVE
+            self.screen_tree.item(iid, tags=("muted",) if leave else (), values=(
+                human(item.size), fmt_date(item.added), self._action_text(item), "; ".join(item.reasons)))
+
+        def set_choice(self, choice):
+            sel = self.screen_tree.selection()
+            item = self.screen_items.get(sel[0]) if sel else None
+            if not isinstance(item, scr.Item) or (self.batch and not self.batch.finished):
+                return "break"
+            if choice == "suggested":
+                self.choices.pop(item.path, None)
+            else:
+                self.choices[item.path] = choice
+            self._apply_choice(item, choice)
+            self._refresh_row(sel[0])
+            self._update_summary()
+            # Jump to the next file so you can go through a group with the keyboard.
+            following = self.screen_tree.next(sel[0])
+            if following:
+                self.screen_tree.selection_set(following)
+                self.screen_tree.focus(following)
+                self.screen_tree.see(following)
+            else:
+                self._show_item_details(item)
+            return "break"
+
+        def _pending(self):
+            s = self.screener
+            if not s:
+                return []
+            return [i for i in s.items if not i.excluded and i.action in (scr.TRASH, scr.MOVE)]
+
+        def _update_summary(self):
+            s = self.screener
+            pending = self._pending()
+            trash = [i for i in pending if i.action == scr.TRASH]
+            move = [i for i in pending if i.action == scr.MOVE]
+            self.screen_summary.set(
+                f"{len(s.items):,} files ({human(sum(i.size for i in s.items))})   •   "
+                f"To Trash: {len(trash):,} ({human(sum(i.size for i in trash))})   •   "
+                f"To organize: {len(move):,}")
+
+        # ---------- applying changes ----------
+
+        def open_apply_dialog(self):
+            if not self.screener or not self.screener.done or (self.batch and not self.batch.finished):
+                return
+            pending = self._pending()
+            if not pending:
+                messagebox.showinfo("FileCleaner", "There are no suggested changes to apply.")
+                return
+            by_group = {}
+            for item in pending:
+                by_group.setdefault(item.group, []).append(item)
+
+            dlg = tk.Toplevel(self.win)
+            dlg.title("Apply suggestions")
+            dlg.transient(self.win)
+            dlg.resizable(False, False)
+            dlg.geometry(f"+{self.win.winfo_rootx() + 250}+{self.win.winfo_rooty() + 120}")
+            body = ttk.Frame(dlg, padding=18)
+            body.pack(fill="both", expand=True)
+            ttk.Label(body, text="Apply these changes?", font=("Helvetica", 16, "bold")).pack(anchor="w")
+            ttk.Label(body, wraplength=560, foreground="gray", text=(
+                "Trashed files go to the macOS Trash, so you can still restore them. Nothing is "
+                "overwritten, and \"Undo last apply\" puts the whole batch back.")).pack(anchor="w", pady=(4, 12))
+
+            checks = []
+            total_var = tk.StringVar()
+
+            def chosen_items():
+                return [i for var, items in checks if var.get() for i in items]
+
+            def update_total():
+                chosen = chosen_items()
+                trash_bytes = sum(i.size for i in chosen if i.action == scr.TRASH)
+                total_var.set(f"{len(chosen):,} files selected. Frees {human(trash_bytes)} once you empty the Trash.")
+                apply_button.configure(state="normal" if chosen else "disabled")
+
+            for key, title, _blurb in scr.GROUPS:
+                items = by_group.get(key)
+                if not items:
+                    continue
+                trash = [i for i in items if i.action == scr.TRASH]
+                move = [i for i in items if i.action == scr.MOVE]
+                verbs = " and ".join(p for p in (f"trash {len(trash):,}" if trash else "",
+                                                 f"move {len(move):,}" if move else "") if p)
+                var = tk.BooleanVar(value=key != "maybe_school")
+                ttk.Checkbutton(body, variable=var, command=update_total, text=(
+                    f"{title}: {verbs} file{'s' if len(items) != 1 else ''} "
+                    f"({human(sum(i.size for i in items))})")).pack(anchor="w", pady=(6, 0))
+                destinations = sorted({scr.short_path(i.destination) for i in move})
+                if destinations:
+                    shown = ", ".join(destinations[:3])
+                    if len(destinations) > 3:
+                        shown += f", and {len(destinations) - 3} more"
+                    ttk.Label(body, text=f"into {shown}", foreground="gray",
+                              wraplength=530).pack(anchor="w", padx=(26, 0))
+                if key == "maybe_school":
+                    ttk.Label(body, foreground="#b8860b", text=(
+                        "Off by default: these are uncertain guesses, so check them first.")).pack(anchor="w", padx=(26, 0))
+                checks.append((var, items))
+
+            ttk.Label(body, textvariable=total_var, font=("Helvetica", 13, "bold")).pack(anchor="w", pady=(16, 10))
+            buttons = ttk.Frame(body)
+            buttons.pack(fill="x")
+
+            def do_apply():
+                chosen = chosen_items()
+                dlg.destroy()
+                if chosen:
+                    self.start_batch(chosen)
+
+            apply_button = ttk.Button(buttons, text="Apply", command=do_apply, default="active")
+            apply_button.pack(side="right")
+            ttk.Button(buttons, text="Cancel", command=dlg.destroy).pack(side="right", padx=6)
+            dlg.bind("<Escape>", lambda e: dlg.destroy())
+            update_total()
+            dlg.grab_set()
+            apply_button.focus_set()
+
+        def start_batch(self, items):
+            self.batch = actions.Batch(items)
+            threading.Thread(target=self.batch.run, daemon=True).start()
+            for button in (self.apply_btn, self.undo_btn, self.screen_btn):
+                button.configure(state="disabled")
+            self.screen_spinner.start(12)
+            self._poll_batch()
+
+        def _poll_batch(self):
+            b = self.batch
+            if not b.finished:
+                self.status_var.set(f"Applying... {b.done_count:,} of {len(b.items):,}")
+                self.win.after(100, self._poll_batch)
+                return
+            self.screen_spinner.stop()
+            self.screen_btn.configure(state="normal")
+
+            def files(n):
+                return f"{n:,} file{'s' if n != 1 else ''}"
+
+            lines = []
+            if b.moved:
+                lines.append(f"Moved {files(len(b.moved))} into folders.")
+            if b.trashed:
+                lines.append(f"Moved {files(len(b.trashed))} to the Trash "
+                             f"({human(sum(i.size for i in b.trashed))}).")
+            if b.skipped:
+                lines.append(f"\nSkipped {files(len(b.skipped))}:")
+                lines += [f"  {i.name}: {why}" for i, why in b.skipped[:12]]
+                if len(b.skipped) > 12:
+                    lines.append(f"  ...and {len(b.skipped) - 12:,} more")
+            messagebox.showinfo("FileCleaner", "\n".join(lines) or "Nothing was changed.")
+            for item in b.moved + b.trashed:
+                self.choices.pop(item.path, None)
+            self._update_undo_button()
+            self.start_screen()
+
+        def _update_undo_button(self):
+            batch, _entries = actions.last_batch()
+            self.undo_btn.configure(state="normal" if batch else "disabled")
+
+        def undo_last_apply(self):
+            if self.batch and not self.batch.finished:
+                return
+            batch, entries = actions.last_batch()
+            if not batch:
+                return
+            count = sum(1 for e in entries if e.get("op") in ("trash", "move"))
+            when = time.strftime("%b %d at %I:%M %p", time.strptime(batch[:15], "%Y%m%d-%H%M%S"))
+            if not messagebox.askyesno("Undo last apply",
+                                       f"Put the {count:,} files from the batch applied {when} back where they were?"):
+                return
+            restored, problems = actions.undo_last()
+            message = f"Put back {restored:,} file{'s' if restored != 1 else ''}."
+            if problems:
+                message += f"\n\nCouldn't put back {len(problems):,}:\n" + "\n".join(problems[:12])
+            messagebox.showinfo("FileCleaner", message)
+            self._update_undo_button()
+            self.start_screen()
+
+        # ---------- viewing (non-destructive) ----------
+
+        def _screen_popup(self, event):
+            iid = self.screen_tree.identify_row(event.y)
+            if not iid or not isinstance(self.screen_items.get(iid), scr.Item):
+                return
+            self.screen_tree.selection_set(iid)
+            self.screen_tree.focus(iid)
+            self.screen_menu.tk_popup(event.x_root, event.y_root)
+
+        def _screen_action(self, action):
+            item = self._selected_screen_item()
+            if item is None:
+                return
+            if action == "quicklook":
+                subprocess.Popen(["qlmanage", "-p", item.path],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif action == "reveal":
+                subprocess.run(["open", "-R", item.path])
+            elif action == "copy":
+                self.win.clipboard_clear()
+                self.win.clipboard_append(item.path)
+                self.status_var.set(f"Copied: {item.path}")
+
+        # ======================================================================
+        # Disk Explorer tab
+        # ======================================================================
+
+        def _build_disk_tab(self, start_path):
+            tab = ttk.Frame(self.main_tabs, padding=(0, 6, 0, 0))
+            self.main_tabs.add(tab, text="Disk Explorer")
+
+            top = ttk.Frame(tab)
+            top.pack(fill="x", pady=(0, 6))
+            ttk.Label(top, text="Folder:").pack(side="left")
+            self.path_var = tk.StringVar(value=start_path)
+            entry = ttk.Entry(top, textvariable=self.path_var)
+            entry.pack(side="left", fill="x", expand=True, padx=6)
+            entry.bind("<Return>", lambda e: self.start_scan())
+            ttk.Button(top, text="Choose...", command=self.choose_folder).pack(side="left")
+            self.scan_btn = ttk.Button(top, text="Scan", command=self.start_scan)
+            self.scan_btn.pack(side="left", padx=(6, 0))
+            self.stop_btn = ttk.Button(top, text="Stop", command=self.stop_scan, state="disabled")
+            self.stop_btn.pack(side="left", padx=(6, 0))
+            self.spinner = ttk.Progressbar(top, mode="indeterminate", length=100)
+            self.spinner.pack(side="left", padx=(10, 0))
+
+            self.explorer_tabs = ttk.Notebook(tab)
+            self.explorer_tabs.pack(fill="both", expand=True)
+            self._build_explorer_tab()
+            self._build_largest_tab()
+            self._build_types_tab()
+
         def _build_explorer_tab(self):
-            paned = ttk.PanedWindow(self.notebook, orient="horizontal")
-            self.notebook.add(paned, text="Explorer")
+            paned = ttk.PanedWindow(self.explorer_tabs, orient="horizontal")
+            self.explorer_tabs.add(paned, text="Folders")
 
             frame, tree = self._scrolled_tree(paned, ("size", "share", "items", "modified", "safety"))
             self.tree = tree
-            for col, label, width, anchor in (
+            self._setup_columns(tree, (
                 ("#0", "Name", 280, "w"),
                 ("size", "Size", 90, "e"),
                 ("share", "% of parent", 150, "w"),
                 ("items", "Files", 90, "e"),
                 ("modified", "Modified", 90, "center"),
                 ("safety", "Safety", 200, "w"),
-            ):
-                tree.heading(col, text=label)
-                tree.column(col, width=width, anchor=anchor, stretch=(col in ("#0", "safety")))
+            ), stretch=("#0", "safety"))
             tree.bind("<<TreeviewOpen>>", self.on_tree_open)
             tree.bind("<<TreeviewSelect>>", self.on_tree_select)
             self._bind_context_menu(tree, lambda iid: self.tree_nodes.get(iid))
@@ -415,7 +691,7 @@ def run_gui(start_path):
             bar = ttk.Frame(right)
             bar.pack(fill="x", pady=(0, 4))
             ttk.Button(bar, text="Up", width=4, command=self.map_up).pack(side="left")
-            self.map_title = tk.StringVar()
+            self.map_title = tk.StringVar(value="Press Scan to map a folder.")
             ttk.Label(bar, textvariable=self.map_title, anchor="w").pack(side="left", padx=6, fill="x", expand=True)
             self.canvas = tk.Canvas(right, background="#20242a", highlightthickness=0)
             self.canvas.pack(fill="both", expand=True)
@@ -437,32 +713,28 @@ def run_gui(start_path):
             paned.add(right, weight=2)
 
         def _build_largest_tab(self):
-            frame, tree = self._scrolled_tree(self.notebook, ("size", "modified", "safety", "path"), show="headings")
+            frame, tree = self._scrolled_tree(self.explorer_tabs, ("size", "modified", "safety", "path"), show="headings")
             self.largest_tree = tree
-            for col, label, width, anchor in (
+            self._setup_columns(tree, (
                 ("size", "Size", 90, "e"),
                 ("modified", "Modified", 90, "center"),
                 ("safety", "Safety", 200, "w"),
                 ("path", "Path", 700, "w"),
-            ):
-                tree.heading(col, text=label)
-                tree.column(col, width=width, anchor=anchor, stretch=(col == "path"))
+            ), stretch=("path",))
             tree.bind("<Double-Button-1>", lambda e: self._show_in_explorer(self.list_nodes.get(tree.focus())))
             self._bind_context_menu(tree, lambda iid: self.list_nodes.get(iid))
-            self.notebook.add(frame, text="Largest files")
+            self.explorer_tabs.add(frame, text="Largest files")
 
         def _build_types_tab(self):
-            frame, tree = self._scrolled_tree(self.notebook, ("size", "share", "count"))
+            frame, tree = self._scrolled_tree(self.explorer_tabs, ("size", "share", "count"))
             self.types_tree = tree
-            for col, label, width, anchor in (
+            self._setup_columns(tree, (
                 ("#0", "Category / extension", 260, "w"),
                 ("size", "Size", 100, "e"),
                 ("share", "% of scanned", 180, "w"),
                 ("count", "Files", 100, "e"),
-            ):
-                tree.heading(col, text=label)
-                tree.column(col, width=width, anchor=anchor, stretch=(col == "#0"))
-            self.notebook.add(frame, text="File types")
+            ), stretch=("#0",))
+            self.explorer_tabs.add(frame, text="File types")
 
         # ---------- context menu ----------
 
@@ -638,7 +910,8 @@ def run_gui(start_path):
         def _show_in_explorer(self, node):
             if node is None:
                 return
-            self.notebook.select(0)
+            self.main_tabs.select(1)
+            self.explorer_tabs.select(0)
             self._reveal_in_tree(node)
 
         # ---------- treemap ----------
@@ -725,7 +998,7 @@ def run_gui(start_path):
             if node is not None and node.is_dir and node.children:
                 self.set_map_node(node)
 
-        # ---------- other tabs ----------
+        # ---------- other explorer tabs ----------
 
         def _fill_largest(self, s):
             tree = self.largest_tree
@@ -763,18 +1036,20 @@ def run_gui(start_path):
                                 values=(human(size), bar(size / total), f"{count:,}"))
 
         def on_close(self):
-            if self.scanner:
-                self.scanner.cancel()
+            for job in (self.scanner, self.screener):
+                if job:
+                    job.cancel()
+            shutil.rmtree(self.thumb_dir, ignore_errors=True)
             self.win.destroy()
 
     win = tk.Tk()
     app = App(win)
-    win.after(200, app.start_scan)
+    win.after(200, app.start_screen)
     win.mainloop()
 
 
 # --------------------------------------------------------------------------
-# Text report (no GUI)
+# Text reports (no GUI)
 # --------------------------------------------------------------------------
 
 def run_report(path, top=15):
@@ -790,26 +1065,63 @@ def run_report(path, top=15):
         return f"  [{level.upper()}: {reason}]" if level else ""
 
     print(f"\n{root.path()}: {human(root.size)} in {root.count:,} files\n")
-    print(f"Biggest items in this folder:")
+    print("Biggest items in this folder:")
     for child in root.children[:top]:
         kind = "dir " if child.is_dir else "file"
         print(f"  {human(child.size):>10}  {kind}  {child.name}{safety(child)}")
-    print(f"\nLargest files:")
+    print("\nLargest files:")
     for node in scanner.largest_files()[:top]:
         print(f"  {human(node.size):>10}  {node.path()}{safety(node)}")
-    print(f"\nBiggest file types:")
+    print("\nBiggest file types:")
     for ext, (size, count) in sorted(scanner.ext_stats.items(), key=lambda kv: kv[1][0], reverse=True)[:top]:
         print(f"  {human(size):>10}  {count:>8,} files  .{ext}")
     if scanner.unreadable:
         print(f"\n{len(scanner.unreadable):,} folders couldn't be read (need Full Disk Access).")
 
 
+def run_screen_report(json_path=None, per_group=10):
+    s = scr.Screener()
+    print("Screening Downloads and Desktop (read-only)...", file=sys.stderr)
+    s.run()
+    if s.error:
+        sys.exit(f"Screening failed: {s.error}")
+    for folder in s.blocked:
+        print(f"macOS blocked access to {folder} - allow it in System Settings > "
+              "Privacy & Security > Files and Folders.", file=sys.stderr)
+
+    info = s.summary()
+    print(f"\n{info['files']:,} files ({human(info['bytes'])}). "
+          f"Suggested for Trash: {info['trash_count']:,} ({human(info['trash_bytes'])}). "
+          f"To organize: {info['move_count']:,}.")
+    for _key, title, blurb, items in s.grouped():
+        print(f"\n== {title}: {len(items):,} files, {human(sum(i.size for i in items))} ==  ({blurb})")
+        for item in items[:per_group]:
+            print(f"  {human(item.size):>10}  {scr.short_path(item.path)}")
+            print(f"              -> {scr.describe_action(item)}  ({'; '.join(item.reasons)})")
+        if len(items) > per_group:
+            print(f"  ... and {len(items) - per_group:,} more")
+
+    if json_path:
+        rows = [{
+            "path": i.path, "size": i.size, "group": i.group, "action": i.action,
+            "destination": i.destination, "reasons": i.reasons, "added": fmt_date(i.added),
+            "last_opened": fmt_date(i.last_used), "downloaded_from": i.where_from,
+        } for i in s.items]
+        with open(json_path, "w") as f:
+            json.dump(rows, f, indent=2)
+        print(f"\nWrote {len(rows):,} suggestions to {json_path}", file=sys.stderr)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Visualize disk usage on your Mac (read-only).")
-    parser.add_argument("path", nargs="?", default=HOME, help="folder to scan (default: your home folder)")
-    parser.add_argument("--report", action="store_true", help="print a text summary instead of opening the GUI")
+    parser = argparse.ArgumentParser(description="Understand and tidy up files on your Mac (read-only).")
+    parser.add_argument("path", nargs="?", default=HOME, help="folder for the Disk Explorer (default: home)")
+    parser.add_argument("--report", action="store_true", help="print a disk-usage summary of PATH instead of opening the app")
+    parser.add_argument("--screen", action="store_true", help="print the screener's suggestions instead of opening the app")
+    parser.add_argument("--json", metavar="FILE", help="with --screen, also save all suggestions to a JSON file")
     args = parser.parse_args()
-    if args.report:
+    if args.screen:
+        run_screen_report(args.json)
+    elif args.report:
         run_report(args.path)
     else:
         run_gui(os.path.expanduser(args.path))
