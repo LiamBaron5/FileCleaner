@@ -66,7 +66,7 @@ FileCleaner is built to never touch anything your Mac needs:
 ## Getting started
 
 ```bash
-git clone https://github.com/<your-username>/FileCleaner.git
+git clone https://github.com/LiamBaron5/FileCleaner.git
 cd FileCleaner
 python3 FileCleaner.py
 ```
@@ -137,8 +137,6 @@ The Screener's settings are at the top of `screener.py`:
 ## Disclaimer
 
 FileCleaner only moves files to the Trash or into its own organizing folders, and every change can be undone. Still, check the suggestions before applying them, especially the first time.
-
-Creating a tool for me to help reorganize the file paths on my Mac.
 
 ---
 
