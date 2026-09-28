@@ -143,3 +143,7 @@ FileCleaner only moves files to the Trash or into its own organizing folders, an
 ## Reflection
 
 I built FileCleaner to fix a real problem of my own: my Downloads and Desktop folders were full of old installers, duplicates, and school files scattered everywhere. Because the program moves files on my own computer, safety shaped the whole design. I kept the code that only *looks* at files (`screener.py`) separate from the one file allowed to *change* them (`actions.py`), and I added the Trash-instead-of-delete, re-checks before every change, and undo so a mistake is never permanent. Detecting school work taught me that real data is messy. No single clue is reliable, so the program combines several weaker signals (where a file was downloaded from, course codes, keywords, file type) into a score. It was also my first larger multi-file Python project with a GUI, which made me think about organizing code into modules with clear jobs. Next I want to work through the roadmap, starting with custom destination folders.
+
+---
+
+This project is part of my portfolio: **https://LiamBaron5.github.io**
