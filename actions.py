@@ -3,7 +3,8 @@ Actions - the ONLY part of FileCleaner that changes files.
 
 It can do exactly two things, and only when you ask:
   * move a file to the macOS Trash (restorable from the Trash, or with Undo)
-  * move a file into one of FileCleaner's organizing folders
+  * move a file into one of FileCleaner's organizing folders, or into an
+    ordinary folder you picked inside your home folder
 
 Every action is checked again right before it happens (the file still exists,
 it isn't a protected/caution path, and the destination is an allowed folder),
@@ -26,8 +27,28 @@ HISTORY_FILE = os.path.join(HOME, "Library", "Application Support", "FileCleaner
 
 
 def allowed_destinations():
-    """Folders files may be moved into. Anything else is refused."""
-    return [scr.SCHOOL_ROOT, scr.ARCHIVED_SCREENSHOTS]
+    """FileCleaner's own organizing folders, which suggestions move files into."""
+    return list(scr.ORGANIZED_DIRS)
+
+
+def destination_problem(folder):
+    """Return why files can't be moved into folder, or None if it's fine.
+
+    FileCleaner's own folders are always allowed. Any other folder (one you
+    picked with "Move to a folder...") must be inside your home folder and must
+    not be protected or caution (app data, settings, hidden folders, apps).
+    Symlinks are resolved first, so a link can't point the move elsewhere.
+    """
+    folder = os.path.abspath(folder)
+    if any(folder == d or folder.startswith(d + "/") for d in allowed_destinations()):
+        return None
+    real = os.path.realpath(folder)
+    if not real.startswith(HOME + "/"):
+        return "outside your home folder"
+    level, reason = classify(real)
+    if level:
+        return f"protected ({reason})"
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -133,10 +154,13 @@ def _check_safe(item):
         return "outside Downloads/Desktop"
     if item.action == scr.MOVE:
         dest = os.path.abspath(item.destination)
-        if not any(dest == d or dest.startswith(d + "/") for d in allowed_destinations()):
-            return f"destination not allowed ({scr.short_path(dest)})"
+        problem = destination_problem(dest)
+        if problem:
+            return f"destination not allowed ({scr.short_path(dest)}: {problem})"
         if os.path.abspath(item.path) == dest or dest.startswith(os.path.abspath(item.path) + "/"):
             return "destination is inside the item itself"
+        if os.path.dirname(os.path.abspath(item.path)) == dest:
+            return "already in that folder"
     elif item.action != scr.TRASH:
         return "nothing to do"
     return None

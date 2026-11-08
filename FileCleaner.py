@@ -124,7 +124,8 @@ def run_gui(start_path):
             self.preview_path = None
             self.preview_image = None  # keep a reference so Tk doesn't discard it
             self.original = {}  # path -> (action, destination) the screener suggested
-            self.choices = {}  # path -> "trash" / "leave" / "suggested", kept across rescans
+            self.choices = {}  # path -> (choice, destination), kept across rescans
+            self.last_folder = scr.DOCUMENTS  # where "Move to a folder..." starts
             self.batch = None
 
             win.title("FileCleaner")
@@ -156,6 +157,7 @@ def run_gui(start_path):
             self.screen_menu.add_command(label="Copy path", command=lambda: self._screen_action("copy"))
             self.screen_menu.add_separator()
             self.screen_menu.add_command(label="Trash this file  (T)", command=lambda: self.set_choice("trash"))
+            self.screen_menu.add_command(label="Move to a folder...  (M)", command=self.choose_folder)
             self.screen_menu.add_command(label="Don't change this file  (L)", command=lambda: self.set_choice("leave"))
             self.screen_menu.add_command(label="Back to the suggestion  (S)", command=lambda: self.set_choice("suggested"))
 
@@ -218,6 +220,8 @@ def run_gui(start_path):
             for key, choice in (("t", "trash"), ("l", "leave"), ("s", "suggested")):
                 tree.bind(f"<KeyPress-{key}>", lambda e, c=choice: self.set_choice(c))
                 tree.bind(f"<KeyPress-{key.upper()}>", lambda e, c=choice: self.set_choice(c))
+            tree.bind("<KeyPress-m>", lambda e: self.choose_folder())
+            tree.bind("<KeyPress-M>", lambda e: self.choose_folder())
             for seq in ("<Button-2>", "<Button-3>", "<Control-Button-1>"):
                 tree.bind(seq, self._screen_popup)
             paned.add(frame, weight=3)
@@ -289,7 +293,8 @@ def run_gui(start_path):
                     "Files and Folders (for Terminal / VS Code), then press Rescan.")
             else:
                 self.status_var.set("Screening finished. Select a file to preview it. Keys: T = trash, "
-                                    "L = don't change, S = back to suggestion. Nothing changes until you press Apply.")
+                                    "M = move to a folder, L = don't change, S = back to suggestion. "
+                                    "Nothing changes until you press Apply.")
 
         def _fill_screen_tree(self, s):
             tree = self.screen_tree
@@ -298,7 +303,7 @@ def run_gui(start_path):
             self.original = {i.path: (i.action, i.destination) for i in s.items}
             for item in s.items:
                 if item.path in self.choices:
-                    self._apply_choice(item, self.choices[item.path])
+                    self._apply_choice(item, *self.choices[item.path])
             self._update_summary()
 
             for key, title, blurb, items in s.grouped():
@@ -416,11 +421,13 @@ def run_gui(start_path):
 
         # ---------- your choices ----------
 
-        def _apply_choice(self, item, choice):
+        def _apply_choice(self, item, choice, folder=""):
             action, destination = self.original.get(item.path, (item.action, item.destination))
             item.excluded = choice == "leave"
             if choice == "trash":
                 item.action, item.destination = scr.TRASH, ""
+            elif choice == "move":
+                item.action, item.destination = scr.MOVE, folder
             else:
                 item.action, item.destination = action, destination
 
@@ -438,7 +445,29 @@ def run_gui(start_path):
             self.screen_tree.item(iid, tags=("muted",) if leave else (), values=(
                 human(item.size), fmt_date(item.added), self._action_text(item), "; ".join(item.reasons)))
 
-        def set_choice(self, choice):
+        def choose_folder(self):
+            """Ask for any folder to move the selected file into (the M key)."""
+            item = self._selected_screen_item()
+            if not item or (self.batch and not self.batch.finished):
+                return "break"
+            folder = filedialog.askdirectory(parent=self.win, initialdir=self.last_folder,
+                                             title=f"Move “{item.name}” to...")
+            self.screen_tree.focus_set()
+            if not folder:
+                return "break"
+            folder = os.path.abspath(folder)
+            problem = actions.destination_problem(folder)
+            if not problem and os.path.dirname(item.path) == folder:
+                problem = "the file is already in that folder"
+            if not problem and (folder == item.path or folder.startswith(item.path + "/")):
+                problem = "that folder is inside the item itself"
+            if problem:
+                messagebox.showerror("FileCleaner", f"Can't move files into {scr.short_path(folder)}:\n{problem}.")
+                return "break"
+            self.last_folder = folder
+            return self.set_choice("move", folder)
+
+        def set_choice(self, choice, folder=""):
             sel = self.screen_tree.selection()
             item = self.screen_items.get(sel[0]) if sel else None
             if not isinstance(item, scr.Item) or (self.batch and not self.batch.finished):
@@ -446,8 +475,8 @@ def run_gui(start_path):
             if choice == "suggested":
                 self.choices.pop(item.path, None)
             else:
-                self.choices[item.path] = choice
-            self._apply_choice(item, choice)
+                self.choices[item.path] = (choice, folder)
+            self._apply_choice(item, choice, folder)
             self._refresh_row(sel[0])
             self._update_summary()
             # Jump to the next file so you can go through a group with the keyboard.
@@ -521,7 +550,9 @@ def run_gui(start_path):
                 move = [i for i in items if i.action == scr.MOVE]
                 verbs = " and ".join(p for p in (f"trash {len(trash):,}" if trash else "",
                                                  f"move {len(move):,}" if move else "") if p)
-                var = tk.BooleanVar(value=key != "maybe_school")
+                # "Possibly school work" starts unchecked, unless you picked a folder for one yourself.
+                var = tk.BooleanVar(value=key != "maybe_school"
+                                    or any(self.choices.get(i.path, ("",))[0] == "move" for i in items))
                 ttk.Checkbutton(body, variable=var, command=update_total, text=(
                     f"{title}: {verbs} file{'s' if len(items) != 1 else ''} "
                     f"({human(sum(i.size for i in items))})")).pack(anchor="w", pady=(6, 0))

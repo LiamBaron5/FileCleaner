@@ -5,12 +5,13 @@ macOS desktop app (Python 3.13 + tkinter, standard library only) for understandi
 ## Layout
 - `FileCleaner.py` — entry point: tkinter GUI plus CLI flags (`--screen`, `--json`, `--report`).
 - `core.py` — safety classification (`PROTECTED` / `CAUTION`), file categories, formatting, read-only disk `Scanner`.
-- `screener.py` — READ-ONLY. Sorts Downloads/Desktop files into groups with suggested actions.
+- `screener.py` — READ-ONLY. Sorts Downloads/Desktop files into groups with suggested actions and destination folders. Top-level folders are one item, classified by contents (`_classify_folder`). Rule settings (roots, `TOPIC_FOLDERS`, `PERSONAL_RULES`, sites, extensions) are at the top.
 - `actions.py` — the ONLY module that changes files: move to Trash (via macOS API) or move into allowed organizing folders. Logs to `~/Library/Application Support/FileCleaner/history.jsonl` for undo.
 
 ## Rules
 - Keep `core.py` and `screener.py` read-only; any file-changing code belongs in `actions.py`.
 - Never hard-delete: Trash only, never overwrite, re-check safety right before acting.
+- Move destinations are checked by `actions.destination_problem()`: FileCleaner's own folders (`scr.ORGANIZED_DIRS`), or any non-protected folder inside the home folder (symlinks resolved).
 - No third-party dependencies.
 
 ## Run / check

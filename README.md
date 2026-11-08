@@ -1,6 +1,6 @@
 # FileCleaner
 
-A desktop app for macOS that helps you tidy up your **Downloads** and **Desktop** folders safely. It finds clutter like old installers, duplicate files, unfinished downloads and screenshots, recognizes school work and files it into folders by year, and shows you what's taking up space on your Mac.
+A desktop app for macOS that helps you tidy up your **Downloads** and **Desktop** folders safely. It finds clutter like old installers, duplicate files, unfinished downloads and empty folders, then builds a tidy folder structure out of everything else: school work by year and course, personal records, books, data, code projects, and photos, videos and music. It also shows you what's taking up space on your Mac.
 
 Nothing changes until you review the suggestions and press **Apply**. Deleted files go to the macOS Trash, and a whole batch of changes can be undone with one click.
 
@@ -9,7 +9,7 @@ Nothing changes until you review the suggestions and press **Apply**. Deleted fi
 ## Features
 
 ### Screener
-Scans Downloads and Desktop and sorts every file into a group with a suggested action:
+Scans Downloads and Desktop and sorts every file into a group with a suggested action. A folder sitting directly in Downloads or Desktop (a class folder, a Google Drive download, a code project) is treated as **one item** and judged by what's inside it, so it stays together when it's moved.
 
 | Group | What it finds | Suggestion |
 |---|---|---|
@@ -17,9 +17,16 @@ Scans Downloads and Desktop and sorts every file into a group with a suggested a
 | **Duplicate copies** | Exact copies of another file, including copies of files already in Documents | Trash (the original is kept) |
 | **Already-unzipped archives** | `.zip` files sitting next to the folder they were unzipped into | Trash |
 | **Installers** | `.dmg`, `.pkg`, and zipped apps (it also notes when the app is already installed) | Trash |
+| **Empty folders** | Folders with no files in them | Trash |
 | **Screenshots & recordings** | Screenshots and screen recordings, found using macOS's own screenshot tag, not just the filename | Move to `Downloads/Archived Screenshots` |
-| **School work** | Documents that look like coursework | Move to `Documents/School/<year>` |
+| **School work** | Documents, code and lab graphs that look like coursework | Move to `Documents/School/<year>/<course>` |
 | **Possibly school work** | Weaker matches, worth checking | Move to `Documents/School/<year>` (off by default) |
+| **Personal records** | Taxes, bank and brokerage forms, insurance, IDs, leases, resumes and cover letters | Move to `Documents/Personal/<Finance, Insurance & Health, IDs & Records, Housing, Career>` (never Trash) |
+| **Books & papers** | E-books, PDFs named with an ISBN, downloads from publishers like Springer or arXiv | Move to `Documents/Books & Papers` |
+| **Data files** | Datasets (`.csv`, `.dta`, `.parquet`...) and spreadsheets from data sites like FRED or NOAA | Move to `Documents/Data` |
+| **Projects & code** | Folders with git history or mostly code, loose scripts and notebooks | Move to `Documents/Projects` |
+| **Your topics** | Files matching your own topic folders (for example, skiing) | Move to `Documents/<topic>` |
+| **Photos, videos & music** | Images, videos and audio, and folders of them | Move to `~/Pictures`, `~/Movies` or `~/Music` › `From Downloads/<year>` |
 | **Big & not opened in a year** | Large files you haven't opened in over a year | Flagged for review |
 | **Everything else** | Anything without a clear suggestion | Left alone |
 
@@ -28,11 +35,11 @@ Select any file to see a preview, its size, when it was downloaded, when it was 
 ### How school work is detected
 Each file gets a score based on clues:
 - It was downloaded from a school website (your college's domain, Canvas, Gradescope, Overleaf, and similar)
-- Its name contains a course code like `ECON 101` or `BIO_242`
-- Its name contains a word like *essay*, *syllabus*, *problem set*, *lecture* or *midterm*
-- It's a document-type file (`.pdf`, `.docx`, `.pages`, `.pptx`, `.ipynb`, and so on)
+- Its name contains a course code like `ECON 101`, `BIO_242` or `Econ255Final`, or a department like `PHYS`
+- Its name contains a word like *essay*, *syllabus*, *problem set*, *lecture*, *Lec1*, *pre class*, *Qz4* or *midterm*, even inside names like `SampleMidterm`
+- It's a document-type file (`.pdf`, `.docx`, `.pages`, `.pptx`, `.ipynb`, `.py`, `.do`, and so on)
 
-Strong matches go to **School work** and weaker ones to **Possibly school work**. Files are filed by the calendar year they were downloaded.
+Strong matches go to **School work** and weaker ones to **Possibly school work**. Files are filed by the calendar year they were downloaded, and into a folder for the course when one is found (`School/2026/ECON 255`). A clear sign like a course code is needed before a resume or a lab graph counts as school work, so a "Resume Draft" from Google Docs goes to `Personal/Career` instead.
 
 ### Disk Explorer
 A read-only view of what's using space anywhere on your Mac:
@@ -48,7 +55,7 @@ FileCleaner is built to never touch anything your Mac needs:
 
 - **Safety labels on every path.** macOS system locations (`/System`, `/usr`, `/Library`, and so on) are marked **Protected**. App data, settings, installed apps and hidden config files are marked **Caution**. The Screener never shows either kind, and the app refuses to change them even if asked.
 - **Trash, not delete.** Files go to the real macOS Trash, so Finder's *Put Back* works.
-- **Checked again right before every change.** The file must still exist, be inside Downloads or Desktop, and be headed to an approved folder.
+- **Checked again right before every change.** The file must still exist, be inside Downloads or Desktop, and be headed to FileCleaner's own folders or a folder you picked inside your home folder (never app data, hidden folders, or anywhere outside your home folder).
 - **Never overwrites.** If a file with the same name exists, the new one becomes `name (2).pdf`.
 - **Undo.** *Undo last apply* puts an entire batch back and removes any folders it created that are now empty.
 - **History log.** Every change is recorded in `~/Library/Application Support/FileCleaner/history.jsonl`.
@@ -81,6 +88,7 @@ The first time you run it, macOS will ask whether Terminal (or VS Code) can acce
    | Key | Action |
    |---|---|
    | **T** | Trash this file instead |
+   | **M** | Move this file to any folder you pick (you can make a new one) |
    | **L** | Leave this file alone |
    | **S** | Go back to the original suggestion |
    | **Space** | Quick Look |
@@ -106,7 +114,9 @@ The Screener's settings are at the top of `screener.py`:
 
 - `SCHOOL_SITES`: websites whose downloads count as school work (add your own school's domain here)
 - `STRONG_SCHOOL_WORDS` / `WEAK_SCHOOL_WORDS`: filename keywords
-- `SCHOOL_ROOT` and `ARCHIVED_SCREENSHOTS`: where files get organized
+- `SCHOOL_ROOT`, `PERSONAL_ROOT`, `BOOKS_ROOT`, `DATA_ROOT`, `PROJECTS_ROOT`, `PICTURES_ROOT`, ...: where files get organized
+- `TOPIC_FOLDERS`: your own topic folders and the words that send files there
+- `PERSONAL_RULES`, `BOOK_SITES`, `DATA_SITES`: the clues for personal records, books and data
 - `BIG_FILE` and `OLD_AGE`: what counts as "big" and "old"
 
 ---
@@ -117,7 +127,7 @@ The Screener's settings are at the top of `screener.py`:
 |---|---|
 | `FileCleaner.py` | The app window and command-line options |
 | `screener.py` | Sorts files and makes suggestions (read-only) |
-| `actions.py` | The only code that changes files: moving to the Trash, moving into folders, undo, and the history log |
+| `actions.py` | The only code that changes files: moving to the Trash, moving into folders, which folders are allowed, undo, and the history log |
 | `core.py` | Shared safety rules, file categories, and the disk scanner |
 
 ---
@@ -127,7 +137,8 @@ The Screener's settings are at the top of `screener.py`:
 - [x] Disk Explorer
 - [x] Screener with suggestions
 - [x] Apply suggestions, with Undo
-- [ ] Choose a custom destination folder for any file
+- [x] Choose a custom destination folder for any file
+- [x] Suggest a folder structure for everything (personal records, books, data, projects, media, topics)
 - [ ] Suggestions that learn from where you've put similar files
 - [ ] A rules file for your own organization preferences
 - [ ] Optional Claude integration for chatting about how to organize your files
